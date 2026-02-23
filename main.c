@@ -1,5 +1,7 @@
 #include <stdio.h>
 
+#include "vulkan_runtime.h"
+
 #define SIZE 10
 
 int main()
