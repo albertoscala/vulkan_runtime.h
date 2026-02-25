@@ -25,7 +25,7 @@ int main()
     // vulkanKernelLaunch();
     // vulkanDeviceSyncronize();
 
-    // vulkanMemcpy(arr3, d_arr3, sizeof(int) * SIZE, vulkanMemcpyDeviceToHost);
+    vulkanMemcpy(arr3, &d_i32_arr3, sizeof(int) * SIZE, vulkanMemcpyDeviceToHost);
 
     return 0;
 }

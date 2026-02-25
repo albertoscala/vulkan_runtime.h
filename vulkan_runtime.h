@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <cuda_runtime.h>
 
 #define TRANSFER_BUFFER_SIZE (8 * 1024 * 1024) // 8 MB
 
@@ -29,20 +30,26 @@ static VkInstance instance;
 
 static VkPhysicalDevice physicalDevice;
 
-static uint32_t computeQueueFamily;
-static uint32_t transferQueueFamily;
+static uint32_t computeQueueFamily = UINT32_MAX;
+static uint32_t transferQueueFamily = UINT32_MAX;
+
+static uint32_t computeQueueIndex   = 0;
+static uint32_t transferQueueIndex  = 0;
 
 static VkDevice device;
 
 static VkQueue transferQueue;
 static VkQueue computeQueue;
 
+static VkCommandPool transferCommandPool;
+static VkCommandPool computeCommandPool;
+
 static VulkanBuffer transferBuffer;
 
-static VkCommandPool transferCommandPool;
 static VkCommandBuffer transferCommandBuffer;
+static VkCommandBuffer computeCommandBuffer;
 
-typedef struct 
+typedef struct
 {
     VkBuffer buffer;
     VkDeviceMemory memory; 
@@ -50,9 +57,21 @@ typedef struct
     void* mapped;
 } VulkanBuffer;
 
-VkResult vulkanMalloc(VulkanBuffer* buffer, VkDeviceSize size);
-VkBuffer vulkanMemcpy(VulkanBuffer* dst, void* src, size_t len, vulkanMemcpyKind kind);
-VkBuffer vulkanMemset(VulkanBuffer* ptr, int value, VkDeviceSize count);
+typedef struct
+{
+    
+} VulkanKernelArgs;
 
-VkResult vulkanKernelLaunch();
+VkResult vulkanMalloc(VulkanBuffer* buffer, VkDeviceSize size);
+VkResult vulkanMemcpy(void* dst, const void* src, size_t len, vulkanMemcpyKind kind);
+VkResult vulkanMemset(VulkanBuffer* ptr, int value, VkDeviceSize count);
+
+VkResult vulkanKernelLaunch(
+    const char* kernel, 
+    uint32_t block_x, uint32_t block_y, uint32_t block_z,
+    uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
+    uint64_t smem,
+    uint32_t stream,
+    VulkanKernelArgs args
+);
 VkResult vulkanDeviceSyncronize();
