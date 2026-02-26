@@ -1,7 +1,10 @@
 #include "vulkan_runtime.h"
 
 #include <stdio.h>
+#include <string.h>
 #include <inttypes.h>
+#include <stdarg.h>
+#include <stdlib.h>
 
 // ERROR HANDLING
 
@@ -743,57 +746,500 @@ static VkResult recordAndSubmitFill(
 
 VkResult vulkanMemset(VulkanBuffer* ptr, int value, VkDeviceSize count)
 {
-    if (count == 0 || ptr == NULL) {
-        return ptr ? ptr->buffer : VK_NULL_HANDLE;
+    // Basic validation
+    if (ptr == NULL) {
+        fprintf(stderr, "vulkanMemset: ptr is NULL\n");
+        return VK_ERROR_VALIDATION_FAILED_EXT;
+    }
+
+    // Nothing to do but not an error
+    if (count == 0) {
+        return VK_SUCCESS;
     }
 
     if (count > ptr->size) {
-        fprintf(stderr, "vulkanMemset: count (%" PRIu64 ") > buffer size (%" PRIu64 ")\n",
+        fprintf(stderr,
+                "vulkanMemset: count (%" PRIu64 ") > buffer size (%" PRIu64 ")\n",
                 (uint64_t)count, (uint64_t)ptr->size);
-        return VK_NULL_HANDLE;
+        return VK_ERROR_VALIDATION_FAILED_EXT;
     }
 
     // If buffer is host-visible and mapped, do it on CPU.
     if (ptr->mapped != NULL) {
         memset(ptr->mapped, value, (size_t)count);
-        return ptr->buffer;
+        return VK_SUCCESS;
     }
 
     // Device-local buffer: use vkCmdFillBuffer via transfer queue.
-    // vkCmdFillBuffer uses a 32-bit pattern; memset uses 8-bit value.
+    // vkCmdFillBuffer uses a 32-bit pattern; memset uses an 8-bit value.
     // Build a 32-bit pattern with the byte repeated: 0xVVVVVVVV.
     uint8_t v8 = (uint8_t)value;
     uint32_t pattern = 0x01010101u * (uint32_t)v8;
 
-    // Vulkan requires size to be multiple of 4 for vkCmdFillBuffer.
+    // Vulkan requires size and offset to be multiples of 4 for vkCmdFillBuffer.
     if ((count % 4) != 0) {
-        fprintf(stderr, "vulkanMemset: count (%" PRIu64 ") must be 4-byte aligned for device-local memset\n",
+        fprintf(stderr,
+                "vulkanMemset: count (%" PRIu64
+                ") must be 4-byte aligned for device-local memset\n",
                 (uint64_t)count);
-        return VK_NULL_HANDLE;
+        return VK_ERROR_VALIDATION_FAILED_EXT;
     }
 
     VkResult res = recordAndSubmitFill(ptr->buffer, 0, count, pattern);
     if (res != VK_SUCCESS) {
-        fprintf(stderr, "vulkanMemset: vkCmdFillBuffer failed (VkResult = %d)\n", res);
-        return VK_NULL_HANDLE;
+        fprintf(stderr,
+                "vulkanMemset: vkCmdFillBuffer failed (VkResult = %d)\n",
+                res);
+        return res;
     }
 
-    return ptr->buffer;
+    return VK_SUCCESS;
 }
 
-VkResult vulkanKernelLaunch(
-    const char* kernel, 
+// Actual kernel launch function
+static VkResult vulkanKernelLaunchInternal(
+    const char* kernel,
     uint32_t block_x, uint32_t block_y, uint32_t block_z,
-    uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
+    uint32_t grid_x,  uint32_t grid_y,  uint32_t grid_z,
     uint64_t smem,
     uint32_t stream,
-    VulkanKernelArgs args
+    const VulkanKernelArgs* kargs
 )
 {
+    (void)block_x;
+    (void)block_y;
+    (void)block_z;
+    (void)smem;
+    (void)stream;
 
+    if (!kernel || !kargs) {
+        fprintf(stderr, "vulkanKernelLaunchInternal: kernel or kargs is NULL\n");
+        return VK_ERROR_VALIDATION_FAILED_EXT;
+    }
+
+    if (grid_x == 0 || grid_y == 0 || grid_z == 0) {
+        fprintf(stderr, "vulkanKernelLaunchInternal: grid dimensions must be > 0\n");
+        return VK_ERROR_VALIDATION_FAILED_EXT;
+    }
+
+    VkResult res = VK_SUCCESS;
+
+    // ------------------------------------------------------------------------
+    // 1. Load SPIR-V from file
+    // ------------------------------------------------------------------------
+    FILE* f = fopen(kernel, "rb");
+    if (!f) {
+        fprintf(stderr, "vulkanKernelLaunchInternal: failed to open shader file '%s'\n", kernel);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        fprintf(stderr, "vulkanKernelLaunchInternal: fseek failed\n");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    long fileSize = ftell(f);
+    if (fileSize <= 0) {
+        fclose(f);
+        fprintf(stderr, "vulkanKernelLaunchInternal: shader file '%s' is empty or invalid\n", kernel);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    rewind(f);
+
+    uint8_t* codeBytes = (uint8_t*)malloc((size_t)fileSize);
+    if (!codeBytes) {
+        fclose(f);
+        fprintf(stderr, "vulkanKernelLaunchInternal: out of host memory while reading shader\n");
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+
+    size_t readBytes = fread(codeBytes, 1, (size_t)fileSize, f);
+    fclose(f);
+
+    if (readBytes != (size_t)fileSize) {
+        free(codeBytes);
+        fprintf(stderr, "vulkanKernelLaunchInternal: failed to read full shader file '%s'\n", kernel);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    // ------------------------------------------------------------------------
+    // 2. Create shader module
+    // ------------------------------------------------------------------------
+    VkShaderModule shaderModule = VK_NULL_HANDLE;
+
+    VkShaderModuleCreateInfo shaderInfo = {
+        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .pNext    = NULL,
+        .flags    = 0,
+        .codeSize = (size_t)fileSize,
+        .pCode    = (const uint32_t*)codeBytes, // SPIR-V is 32-bit words
+    };
+
+    res = vkCreateShaderModule(device, &shaderInfo, NULL, &shaderModule);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "vulkanKernelLaunchInternal: vkCreateShaderModule failed (VkResult = %d)\n", res);
+        free(codeBytes);
+        return res;
+    }
+
+    // We no longer need the raw code buffer once the module is created
+    free(codeBytes);
+    codeBytes = NULL;
+
+    // ------------------------------------------------------------------------
+    // 3. Descriptor set layout for buffers (set = 0, binding i)
+    // ------------------------------------------------------------------------
+    uint32_t bufferCount = kargs->bufferCount;
+    VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayoutBinding* bindings = NULL;
+
+    if (bufferCount > 0) {
+        bindings = (VkDescriptorSetLayoutBinding*)
+            malloc(sizeof(VkDescriptorSetLayoutBinding) * bufferCount);
+        if (!bindings) {
+            fprintf(stderr, "vulkanKernelLaunchInternal: out of host memory for bindings\n");
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto cleanup;
+        }
+
+        for (uint32_t i = 0; i < bufferCount; ++i) {
+            bindings[i].binding            = i;
+            bindings[i].descriptorType     = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[i].descriptorCount    = 1;
+            bindings[i].stageFlags         = VK_SHADER_STAGE_COMPUTE_BIT;
+            bindings[i].pImmutableSamplers = NULL;
+        }
+
+        VkDescriptorSetLayoutCreateInfo dslInfo = {
+            .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext        = NULL,
+            .flags        = 0,
+            .bindingCount = bufferCount,
+            .pBindings    = bindings,
+        };
+
+        res = vkCreateDescriptorSetLayout(device, &dslInfo, NULL, &descriptorSetLayout);
+        if (res != VK_SUCCESS) {
+            fprintf(stderr, "vulkanKernelLaunchInternal: vkCreateDescriptorSetLayout failed (VkResult = %d)\n", res);
+            goto cleanup;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 4. Pipeline layout (descriptor set + optional push constants)
+    // ------------------------------------------------------------------------
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+
+    VkPushConstantRange pcRange;
+    uint32_t pcRangeCount = 0;
+
+    if (kargs->pushConstants && kargs->pushConstantsSize > 0) {
+        pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcRange.offset     = 0;
+        pcRange.size       = kargs->pushConstantsSize;
+        pcRangeCount       = 1;
+    }
+
+    VkPipelineLayoutCreateInfo plInfo = {
+        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pNext                  = NULL,
+        .flags                  = 0,
+        .setLayoutCount         = (descriptorSetLayout != VK_NULL_HANDLE) ? 1u : 0u,
+        .pSetLayouts            = (descriptorSetLayout != VK_NULL_HANDLE) ? &descriptorSetLayout : NULL,
+        .pushConstantRangeCount = pcRangeCount,
+        .pPushConstantRanges    = (pcRangeCount > 0) ? &pcRange : NULL,
+    };
+
+    res = vkCreatePipelineLayout(device, &plInfo, NULL, &pipelineLayout);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "vulkanKernelLaunchInternal: vkCreatePipelineLayout failed (VkResult = %d)\n", res);
+        goto cleanup;
+    }
+
+    // ------------------------------------------------------------------------
+    // 5. Compute pipeline
+    // ------------------------------------------------------------------------
+    VkPipeline pipeline = VK_NULL_HANDLE;
+
+    VkPipelineShaderStageCreateInfo stageInfo = {
+        .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .pNext  = NULL,
+        .flags  = 0,
+        .stage  = VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = shaderModule,
+        .pName  = "main",   // entry point name in SPIR-V
+        .pSpecializationInfo = NULL,
+    };
+
+    VkComputePipelineCreateInfo cpInfo = {
+        .sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .pNext  = NULL,
+        .flags  = 0,
+        .stage  = stageInfo,
+        .layout = pipelineLayout,
+        .basePipelineHandle = VK_NULL_HANDLE,
+        .basePipelineIndex  = -1,
+    };
+
+    res = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpInfo, NULL, &pipeline);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "vulkanKernelLaunchInternal: vkCreateComputePipelines failed (VkResult = %d)\n", res);
+        goto cleanup;
+    }
+
+    // ------------------------------------------------------------------------
+    // 6. Descriptor pool + set for buffers
+    // ------------------------------------------------------------------------
+    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSet   = VK_NULL_HANDLE;
+
+    if (bufferCount > 0) {
+        VkDescriptorPoolSize poolSize = {
+            .type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = bufferCount,
+        };
+
+        VkDescriptorPoolCreateInfo dpInfo = {
+            .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext         = NULL,
+            .flags         = 0,
+            .maxSets       = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes    = &poolSize,
+        };
+
+        res = vkCreateDescriptorPool(device, &dpInfo, NULL, &descriptorPool);
+        if (res != VK_SUCCESS) {
+            fprintf(stderr, "vulkanKernelLaunchInternal: vkCreateDescriptorPool failed (VkResult = %d)\n", res);
+            goto cleanup;
+        }
+
+        VkDescriptorSetLayout setLayouts[1] = { descriptorSetLayout };
+        VkDescriptorSetAllocateInfo dsAlloc = {
+            .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext              = NULL,
+            .descriptorPool     = descriptorPool,
+            .descriptorSetCount = 1,
+            .pSetLayouts        = setLayouts,
+        };
+
+        res = vkAllocateDescriptorSets(device, &dsAlloc, &descriptorSet);
+        if (res != VK_SUCCESS) {
+            fprintf(stderr, "vulkanKernelLaunchInternal: vkAllocateDescriptorSets failed (VkResult = %d)\n", res);
+            goto cleanup;
+        }
+
+        // Update descriptors with kargs->buffers
+        VkWriteDescriptorSet* writes =
+            (VkWriteDescriptorSet*)malloc(sizeof(VkWriteDescriptorSet) * bufferCount);
+        if (!writes) {
+            fprintf(stderr, "vulkanKernelLaunchInternal: out of host memory for descriptor writes\n");
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto cleanup;
+        }
+
+        for (uint32_t i = 0; i < bufferCount; ++i) {
+            writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].pNext           = NULL;
+            writes[i].dstSet          = descriptorSet;
+            writes[i].dstBinding      = i;
+            writes[i].dstArrayElement = 0;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pImageInfo      = NULL;
+            writes[i].pBufferInfo     = &kargs->buffers[i];
+            writes[i].pTexelBufferView = NULL;
+        }
+
+        vkUpdateDescriptorSets(device, bufferCount, writes, 0, NULL);
+        free(writes);
+    }
+
+    // ------------------------------------------------------------------------
+    // 7. Record commands into computeCommandBuffer
+    // ------------------------------------------------------------------------
+    res = vkResetCommandBuffer(computeCommandBuffer, 0);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "vulkanKernelLaunchInternal: vkResetCommandBuffer failed (VkResult = %d)\n", res);
+        goto cleanup;
+    }
+
+    VkCommandBufferBeginInfo beginInfo = {
+        .sType            = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext            = NULL,
+        .flags            = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        .pInheritanceInfo = NULL,
+    };
+
+    res = vkBeginCommandBuffer(computeCommandBuffer, &beginInfo);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "vulkanKernelLaunchInternal: vkBeginCommandBuffer failed (VkResult = %d)\n", res);
+        goto cleanup;
+    }
+
+    vkCmdBindPipeline(computeCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+
+    if (bufferCount > 0) {
+        vkCmdBindDescriptorSets(
+            computeCommandBuffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipelineLayout,
+            0,              // firstSet
+            1,              // descriptorSetCount
+            &descriptorSet,
+            0,
+            NULL
+        );
+    }
+
+    if (kargs->pushConstants && kargs->pushConstantsSize > 0) {
+        vkCmdPushConstants(
+            computeCommandBuffer,
+            pipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            kargs->pushConstantsSize,
+            kargs->pushConstants
+        );
+    }
+
+    vkCmdDispatch(computeCommandBuffer, grid_x, grid_y, grid_z);
+
+    res = vkEndCommandBuffer(computeCommandBuffer);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "vulkanKernelLaunchInternal: vkEndCommandBuffer failed (VkResult = %d)\n", res);
+        goto cleanup;
+    }
+
+    // ------------------------------------------------------------------------
+    // 8. Submit to computeQueue and wait with a fence
+    // ------------------------------------------------------------------------
+    VkFenceCreateInfo fenceInfo = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .pNext = NULL,
+        .flags = 0,
+    };
+
+    VkFence fence = VK_NULL_HANDLE;
+    res = vkCreateFence(device, &fenceInfo, NULL, &fence);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "vulkanKernelLaunchInternal: vkCreateFence failed (VkResult = %d)\n", res);
+        goto cleanup;
+    }
+
+    VkSubmitInfo submitInfo = {
+        .sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext                = NULL,
+        .waitSemaphoreCount   = 0,
+        .pWaitSemaphores      = NULL,
+        .pWaitDstStageMask    = NULL,
+        .commandBufferCount   = 1,
+        .pCommandBuffers      = &computeCommandBuffer,
+        .signalSemaphoreCount = 0,
+        .pSignalSemaphores    = NULL,
+    };
+
+    res = vkQueueSubmit(computeQueue, 1, &submitInfo, fence);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "vulkanKernelLaunchInternal: vkQueueSubmit failed (VkResult = %d)\n", res);
+        vkDestroyFence(device, fence, NULL);
+        goto cleanup;
+    }
+
+    res = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(device, fence, NULL);
+
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "vulkanKernelLaunchInternal: vkWaitForFences failed (VkResult = %d)\n", res);
+        goto cleanup;
+    }
+
+    // ------------------------------------------------------------------------
+    // Success
+    // ------------------------------------------------------------------------
+cleanup:
+    if (descriptorPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(device, descriptorPool, NULL);
+    }
+    if (pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, pipeline, NULL);
+    }
+    if (pipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device, pipelineLayout, NULL);
+    }
+    if (descriptorSetLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device, descriptorSetLayout, NULL);
+    }
+    if (bindings) {
+        free(bindings);
+    }
+    if (shaderModule != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(device, shaderModule, NULL);
+    }
+
+    return res;
+}
+
+VkResult vulkanKernelLaunchImpl(
+    const char* kernel, 
+    uint32_t block_x, uint32_t block_y, uint32_t block_z,
+    uint32_t grid_x,  uint32_t grid_y,  uint32_t grid_z,
+    uint64_t smem,
+    uint32_t stream,
+    uint32_t numBuffers,
+    ...
+)
+{
+    // 1. Collect variadic VulkanBuffer* arguments
+    va_list ap;
+    va_start(ap, numBuffers);
+
+    // You can use a VLA if you’re okay with C99:
+    // VkDescriptorBufferInfo bufs[numBuffers];
+    // or heap allocation if you prefer:
+    VkDescriptorBufferInfo* bufs =
+        malloc(sizeof(VkDescriptorBufferInfo) * numBuffers);
+    if (!bufs) {
+        va_end(ap);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+
+    for (uint32_t i = 0; i < numBuffers; ++i) {
+        VulkanBuffer* vb = va_arg(ap, VulkanBuffer*);
+        bufs[i].buffer = vb->buffer;
+        bufs[i].offset = 0;
+        bufs[i].range  = VK_WHOLE_SIZE;  // or VK_WHOLE_SIZE
+    }
+
+    va_end(ap);
+
+    // Push constants
+    VulkanKernelArgs kargs = {
+        .bufferCount        = numBuffers,
+        .buffers            = bufs,
+        .imageCount         = 0,
+        .images             = NULL,
+        .pushConstants      = NULL,
+        .pushConstantsSize  = 0,
+    };
+
+    // Call the real implementation that uses VulkanKernelArgs
+    VkResult res = vulkanKernelLaunchInternal(
+        kernel,
+        block_x, block_y, block_z,
+        grid_x,  grid_y,  grid_z,
+        smem,
+        stream,
+        &kargs
+    );
+
+    free(bufs);
+    return res;
 }
 
 VkResult vulkanDeviceSyncronize()
 {
-
+    return vkDeviceWaitIdle(device);
 }

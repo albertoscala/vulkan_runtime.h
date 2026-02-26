@@ -25,6 +25,14 @@ typedef enum
     vulkanMemcpyDeviceToDevice
 } vulkanMemcpyKind;
 
+typedef struct
+{
+    VkBuffer buffer;
+    VkDeviceMemory memory; 
+    VkDeviceSize size;
+    void* mapped;
+} VulkanBuffer;
+
 // Library vars
 static VkInstance instance;
 
@@ -50,28 +58,45 @@ static VkCommandBuffer transferCommandBuffer;
 static VkCommandBuffer computeCommandBuffer;
 
 typedef struct
-{
-    VkBuffer buffer;
-    VkDeviceMemory memory; 
-    VkDeviceSize size;
-    void* mapped;
-} VulkanBuffer;
-
-typedef struct
-{
-    
+{ 
+    uint32_t bufferCount;
+    const VkDescriptorBufferInfo* buffers;
+    uint32_t imageCount;
+    const VkDescriptorImageInfo* images;
+    const void* pushConstants;
+    uint32_t pushConstantsSize;
 } VulkanKernelArgs;
 
 VkResult vulkanMalloc(VulkanBuffer* buffer, VkDeviceSize size);
 VkResult vulkanMemcpy(void* dst, const void* src, size_t len, vulkanMemcpyKind kind);
 VkResult vulkanMemset(VulkanBuffer* ptr, int value, VkDeviceSize count);
 
-VkResult vulkanKernelLaunch(
-    const char* kernel, 
-    uint32_t block_x, uint32_t block_y, uint32_t block_z,
-    uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
-    uint64_t smem,
-    uint32_t stream,
-    VulkanKernelArgs args
-);
+#define VK_EXPAND(x) x
+
+#define VK_COUNT_ARGS_IMPL( \
+     _1,  _2,  _3,  _4,  _5,  _6,  _7,  _8,  _9, _10, \
+    _11, _12, _13, _14, _15, _16, _17, _18, _19, _20, \
+    N, ...) N
+
+#define VK_COUNT_ARGS(...) \
+    VK_EXPAND(VK_COUNT_ARGS_IMPL(__VA_ARGS__, \
+        20,19,18,17,16,15,14,13,12,11, \
+        10,9,8,7,6,5,4,3,2,1,0))
+
+// public header
+#define vulkanKernelLaunch(kernel,      \
+                           block_x, block_y, block_z, \
+                           grid_x,  grid_y,  grid_z,  \
+                           smem, stream,              \
+                           ...)                       \
+    vulkanKernelLaunchImpl(                          \
+        (kernel),                                    \
+        (block_x), (block_y), (block_z),             \
+        (grid_x),  (grid_y),  (grid_z),              \
+        (smem),                                      \
+        (stream),                                    \
+        VK_COUNT_ARGS(__VA_ARGS__),                  \
+        __VA_ARGS__                                  \
+    )
+
 VkResult vulkanDeviceSyncronize();
