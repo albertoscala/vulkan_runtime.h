@@ -963,14 +963,49 @@ static VkResult vulkanKernelLaunchInternal(
     // ------------------------------------------------------------------------
     VkPipeline pipeline = VK_NULL_HANDLE;
 
+    // 5.a: map block_x/y/z -> specialization constants Bx/By/Bz
+    uint32_t bx = block_x;
+    uint32_t by = block_y;
+    uint32_t bz = block_z;
+
+    // Optional: clamp / validate against device limits
+    // (maxComputeWorkGroupSize, maxComputeWorkGroupInvocations, etc.)
+
+    VkSpecializationMapEntry specEntries[3] = {
+        {
+            .constantID = 0,                         // matches constant_id = 0 (Bx)
+            .offset     = 0 * sizeof(uint32_t),
+            .size       = sizeof(uint32_t),
+        },
+        {
+            .constantID = 1,                         // By
+            .offset     = 1 * sizeof(uint32_t),
+            .size       = sizeof(uint32_t),
+        },
+        {
+            .constantID = 2,                         // Bz
+            .offset     = 2 * sizeof(uint32_t),
+            .size       = sizeof(uint32_t),
+        }
+    };
+
+    uint32_t specData[3] = { bx, by, bz };
+
+    VkSpecializationInfo specInfo = {
+        .mapEntryCount = 3,
+        .pMapEntries   = specEntries,
+        .dataSize      = sizeof(specData),
+        .pData         = specData,
+    };
+
     VkPipelineShaderStageCreateInfo stageInfo = {
         .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
         .pNext  = NULL,
         .flags  = 0,
         .stage  = VK_SHADER_STAGE_COMPUTE_BIT,
         .module = shaderModule,
-        .pName  = "main",   // entry point name in SPIR-V
-        .pSpecializationInfo = NULL,
+        .pName  = "main",
+        .pSpecializationInfo = &specInfo,  // <-- now uses block_x/y/z
     };
 
     VkComputePipelineCreateInfo cpInfo = {
@@ -984,10 +1019,6 @@ static VkResult vulkanKernelLaunchInternal(
     };
 
     res = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpInfo, NULL, &pipeline);
-    if (res != VK_SUCCESS) {
-        fprintf(stderr, "vulkanKernelLaunchInternal: vkCreateComputePipelines failed (VkResult = %d)\n", res);
-        goto cleanup;
-    }
 
     // ------------------------------------------------------------------------
     // 6. Descriptor pool + set for buffers
